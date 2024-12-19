@@ -1,5 +1,4 @@
 use std::ffi::{c_char, c_void, CStr};
-use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
@@ -9,6 +8,21 @@ const LIB_PATH_KPERF: &str = "/System/Library/PrivateFrameworks/kperf.framework/
 const LIB_PATH_KPERFDATA: &str = "/System/Library/PrivateFrameworks/kperfdata.framework/kperfdata";
 
 fn main() {
+    dbg!(count_events(100, || {
+        let mut v = LIB_PATH_KPERF.as_bytes().to_vec();
+        v.sort();
+    }));
+}
+
+#[derive(Debug)]
+struct Run {
+    mean: PerformanceCounters,
+    minimum: PerformanceCounters,
+    maximum: PerformanceCounters,
+    standard_deviation: PerformanceCounters,
+}
+
+fn count_events(repeat: usize, f: impl Fn() -> ()) -> Run {
     let kperf = match unsafe { libloading::Library::new(LIB_PATH_KPERF) } {
         Ok(lib) => lib,
         Err(e) => {
@@ -25,25 +39,80 @@ fn main() {
 
     let mut collector = EventCollector::new(kperf, kperfdata);
 
-    collector.start();
+    let mut samples = Vec::with_capacity(repeat);
 
-    let mut v = LIB_PATH_KPERF.as_bytes().to_vec();
-    v.sort();
+    for _ in 0..repeat {
+        collector.start();
 
-    collector.end();
+        f();
 
-    dbg!(collector.count);
+        samples.push(collector.end());
+    }
+
+    let mut total = PerformanceCounters::default();
+    let mut minimum = PerformanceCounters::from_value(1e300);
+    let mut maximum = PerformanceCounters::from_value(0.0);
+
+    for sample in samples.iter() {
+        let sample = PerformanceCounters::from_event_count(*sample);
+        total += sample;
+        minimum.min(&sample);
+        maximum.max(&sample);
+    }
+
+    let mut mean = total;
+    mean /= repeat as f64;
+
+    let mut variance = PerformanceCounters::default();
+
+    for sample in samples.iter() {
+        let sample = PerformanceCounters::from_event_count(*sample);
+        let diff = sample - mean;
+        variance += diff.squared();
+    }
+
+    Run {
+        mean,
+        minimum,
+        maximum,
+        standard_deviation: variance.sqrt(),
+    }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 struct EventCount {
     elapsed: core::time::Duration,
     event_counts: [u64; 5],
 }
 
+impl std::fmt::Debug for EventCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventCount")
+            .field("elapsed", &self.elapsed)
+            .field("event_counts", &self.event_counts)
+            .field("cycles", &self.cycles())
+            .field("instructions", &self.instructions())
+            .field("missed_branches", &self.missed_branches())
+            .field("branches", &self.branches())
+            .finish()
+    }
+}
+
 impl EventCount {
     const fn cycles(self) -> u64 {
         self.event_counts[0]
+    }
+
+    const fn instructions(self) -> u64 {
+        self.event_counts[1]
+    }
+
+    const fn missed_branches(self) -> u64 {
+        self.event_counts[2]
+    }
+
+    const fn branches(self) -> u64 {
+        self.event_counts[4]
     }
 }
 
@@ -55,8 +124,24 @@ struct EventCollector {
     apple_events: AppleEvents,
     diff: PerformanceCounters,
 
-    kperf: &'static Library,
+    // kept around so that they can be dropped at the end
+    kperf: Option<&'static Library>,
+    kperfdata: Option<&'static Library>,
+
     kperf_symbols: KperfSymbols<'static>,
+    kperfdata_symbols: KperfDataSymbols<'static>,
+}
+
+impl Drop for EventCollector {
+    fn drop(&mut self) {
+        if let Some(library) = self.kperf.take() {
+            let _ = unsafe { Box::from_raw(library as *const Library as *mut Library) };
+        }
+
+        if let Some(library) = self.kperfdata.take() {
+            let _ = unsafe { Box::from_raw(library as *const Library as *mut Library) };
+        }
+    }
 }
 
 impl EventCollector {
@@ -64,8 +149,11 @@ impl EventCollector {
         let kperf = Box::leak(Box::new(kperf));
         let kperf_symbols = unsafe { KperfSymbols::load(kperf).unwrap() };
 
+        let kperfdata = Box::leak(Box::new(kperfdata));
+        let kperfdata_symbols = unsafe { KperfDataSymbols::load(kperfdata).unwrap() };
+
         let mut apple_events = AppleEvents::new();
-        apple_events.setup_performance_counters();
+        apple_events.setup_performance_counters(&kperf_symbols, &kperfdata_symbols);
 
         Self {
             count: EventCount::default(),
@@ -73,13 +161,17 @@ impl EventCollector {
             apple_events,
             diff: PerformanceCounters::default(),
 
-            kperf,
+            kperf: Some(kperf),
             kperf_symbols,
+
+            kperfdata: Some(kperfdata),
+            kperfdata_symbols,
         }
     }
 
     fn has_events(&mut self) -> bool {
-        self.apple_events.setup_performance_counters()
+        self.apple_events
+            .setup_performance_counters(&self.kperf_symbols, &self.kperfdata_symbols)
     }
 
     #[inline(always)]
@@ -138,12 +230,39 @@ impl PerformanceCounters {
         }
     }
 
+    fn from_event_count(event_count: EventCount) -> Self {
+        Self {
+            cycles: event_count.cycles() as f64,
+            branches: event_count.branches() as f64,
+            missed_branches: event_count.missed_branches() as f64,
+            instructions: event_count.instructions() as f64,
+        }
+    }
+
     fn from_value(init: f64) -> Self {
         Self {
             cycles: init,
             branches: init,
             missed_branches: init,
             instructions: init,
+        }
+    }
+
+    fn squared(self) -> Self {
+        Self {
+            cycles: self.cycles * self.cycles,
+            branches: self.branches * self.branches,
+            missed_branches: self.missed_branches * self.missed_branches,
+            instructions: self.instructions * self.instructions,
+        }
+    }
+
+    fn sqrt(self) -> Self {
+        Self {
+            cycles: self.cycles.sqrt(),
+            branches: self.branches.sqrt(),
+            missed_branches: self.missed_branches.sqrt(),
+            instructions: self.instructions.sqrt(),
         }
     }
 
@@ -169,11 +288,18 @@ impl PerformanceCounters {
         self.instructions /= numerator;
     }
 
-    fn min_assign(&mut self, other: &Self) {
-        self.cycles = self.cycles.min(other.cycles);
-        self.branches = self.branches.min(other.branches);
-        self.missed_branches = self.missed_branches.min(other.missed_branches);
-        self.instructions = self.instructions.min(other.instructions);
+    fn min(&mut self, other: &Self) {
+        self.cycles = f64::min(self.cycles, other.cycles);
+        self.branches = f64::min(self.branches, other.branches);
+        self.missed_branches = f64::min(self.missed_branches, other.missed_branches);
+        self.instructions = f64::min(self.instructions, other.instructions);
+    }
+
+    fn max(&mut self, other: &Self) {
+        self.cycles = f64::max(self.cycles, other.cycles);
+        self.branches = f64::max(self.branches, other.branches);
+        self.missed_branches = f64::max(self.missed_branches, other.missed_branches);
+        self.instructions = f64::max(self.instructions, other.instructions);
     }
 }
 
@@ -324,11 +450,9 @@ const profile_events: [event_alias; 4] = [
 unsafe fn get_event(
     kperfdata: &KperfDataSymbols,
     db: *mut kpep_db,
-    alias: *const event_alias,
+    alias: &event_alias,
 ) -> *mut kpep_event {
-    for j in 0..EVENT_NAME_MAX {
-        let name = (*alias).names[j];
-
+    for name in alias.names {
         if name.is_null() {
             break;
         }
@@ -363,32 +487,15 @@ impl AppleEvents {
         }
     }
 
-    fn setup_performance_counters(&mut self) -> bool {
+    fn setup_performance_counters(
+        &mut self,
+        kperf_symbols: &KperfSymbols,
+        kperfdata_symbols: &KperfDataSymbols,
+    ) -> bool {
         if self.init {
             return self.worked;
         }
         self.init = true;
-
-        let kperf = match unsafe { libloading::Library::new(LIB_PATH_KPERF) } {
-            Ok(lib) => lib,
-            Err(e) => {
-                eprintln!("Error loading {LIB_PATH_KPERF}: {:?}", e);
-                self.worked = false;
-                return false;
-            }
-        };
-
-        let kperfdata = match unsafe { libloading::Library::new(LIB_PATH_KPERFDATA) } {
-            Ok(lib) => lib,
-            Err(e) => {
-                eprintln!("Error loading {LIB_PATH_KPERFDATA}: {:?}", e);
-                self.worked = false;
-                return false;
-            }
-        };
-
-        let kperf_symbols = unsafe { KperfSymbols::load(&kperf) }.unwrap();
-        let kperfdata_symbols = unsafe { KperfDataSymbols::load(&kperfdata) }.unwrap();
 
         // Check permission
         let mut force_ctrs = 0;
@@ -622,8 +729,9 @@ struct kpep_db {
 
 macro_rules! load_dynlib_symbols {
     ( $struct_name:ident ; $( $field_name:ident : fn( $( $arg:ty ),* ) -> $ret:ty ),* $(,)? ) => {
+        #[allow(dead_code)]
         pub struct $struct_name<'a> {
-            $( pub $field_name: libloading::Symbol<'a, unsafe extern fn( $( $arg ),* ) -> $ret>, )*
+            $( $field_name: libloading::Symbol<'a, unsafe extern fn( $( $arg ),* ) -> $ret>, )*
         }
 
         impl<'a> $struct_name<'a> {
