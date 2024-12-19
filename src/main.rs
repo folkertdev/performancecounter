@@ -343,7 +343,7 @@ unsafe fn get_event(
 }
 
 struct AppleEvents {
-    regs: [u32; KPC_MAX_COUNTERS],
+    regs: [u64; KPC_MAX_COUNTERS],
     counter_map: [usize; KPC_MAX_COUNTERS],
     counters_0: [u64; KPC_MAX_COUNTERS],
     counters_1: [u64; KPC_MAX_COUNTERS],
@@ -448,7 +448,114 @@ impl AppleEvents {
             }
         }
 
-        todo!()
+        // add event to config
+        for ev in ev_arr.iter_mut() {
+            match unsafe {
+                (kperfdata_symbols.kpep_config_add_event)(cfg, ev, 0, core::ptr::null_mut())
+            } {
+                0 => {}
+                ret => {
+                    // printf( "Failed to force counters: %d (%s).\n", ret, kpep_config_error_desc(ret),);
+                    eprintln!("Failed to force counters");
+                    self.worked = false;
+                    return self.worked;
+                }
+            }
+        }
+
+        // prepare buffer and config
+        let mut classes: u32 = 0;
+        let mut reg_count: usize = 0;
+        match unsafe { (kperfdata_symbols.kpep_config_kpc_classes)(cfg, &mut classes) } {
+            0 => {}
+            ret => {
+                // printf("Failed get kpc classes: %d (%s).\n", ret, kpep_config_error_desc(ret));
+                eprintln!("error");
+                self.worked = false;
+                return self.worked;
+            }
+        }
+        match unsafe { (kperfdata_symbols.kpep_config_kpc_count)(cfg, &mut reg_count) } {
+            0 => {}
+            ret => {
+                // printf("Failed get kpc count: %d (%s).\n", ret, kpep_config_error_desc(ret));
+                eprintln!("error");
+                self.worked = false;
+                return self.worked;
+            }
+        }
+        match unsafe {
+            (kperfdata_symbols.kpep_config_kpc_map)(
+                cfg,
+                self.counter_map.as_mut_ptr(),
+                core::mem::size_of_val(&self.counter_map),
+            )
+        } {
+            0 => {}
+            ret => {
+                // printf("Failed get kpc map: %d (%s).\n", ret, kpep_config_error_desc(ret));
+
+                eprintln!("error");
+                self.worked = false;
+                return self.worked;
+            }
+        }
+        match unsafe {
+            (kperfdata_symbols.kpep_config_kpc)(
+                cfg,
+                self.regs.as_mut_ptr(),
+                core::mem::size_of_val(&self.regs),
+            )
+        } {
+            0 => {}
+            ret => {
+                // printf("Failed get kpc registers: %d (%s).\n", ret, kpep_config_error_desc(ret));
+                eprintln!("error");
+                self.worked = false;
+                return self.worked;
+            }
+        }
+
+        // set config to kernel
+        match unsafe { (kperf_symbols.kpc_force_all_ctrs_set)(1) } {
+            0 => {}
+            ret => {
+                eprintln!("Failed force all ctrs: {ret}");
+                self.worked = false;
+                return self.worked;
+            }
+        }
+        if (classes & KPC_CLASS_CONFIGURABLE_MASK as u32) != 0 && reg_count != 0 {
+            match unsafe { (kperf_symbols.kpc_set_config)(classes, self.regs.as_ptr()) } {
+                0 => {}
+                ret => {
+                    eprintln!("Failed set kpc config: {ret}");
+                    self.worked = false;
+                    return self.worked;
+                }
+            }
+        }
+
+        // start counting
+        match unsafe { (kperf_symbols.kpc_set_counting)(classes) } {
+            0 => {}
+            ret => {
+                eprintln!("Failed set counting: {ret}");
+                self.worked = false;
+                return self.worked;
+            }
+        }
+        match unsafe { (kperf_symbols.kpc_set_thread_counting)(classes) } {
+            0 => {}
+            ret => {
+                eprintln!("Failed set thread counting: {ret}");
+                self.worked = false;
+                return self.worked;
+            }
+        }
+
+        self.worked = true;
+        self.worked
     }
 
     fn get_counters(&mut self, kperf: &KperfSymbols) -> PerformanceCounters {
@@ -593,3 +700,21 @@ load_dynlib_symbols!(
     kpep_event_alias: fn(*mut kpep_event, *mut *const c_char) -> i32,
     kpep_event_description: fn(*mut kpep_event, *mut *const c_char) -> i32,
 );
+
+// -----------------------------------------------------------------------------
+// <kperf.framework> header (reverse engineered)
+// This framework wraps some sysctl calls to communicate with the kpc in kernel.
+// Most functions requires root privileges, or process is "blessed".
+// -----------------------------------------------------------------------------
+
+// Cross-platform class constants.
+const KPC_CLASS_FIXED: usize = 0;
+const KPC_CLASS_CONFIGURABLE: usize = 1;
+const KPC_CLASS_POWER: usize = 2;
+const KPC_CLASS_RAWPMU: usize = 3;
+
+// Cross-platform class mask constants.
+const KPC_CLASS_FIXED_MASK: usize = 1 << KPC_CLASS_FIXED; // 1
+const KPC_CLASS_CONFIGURABLE_MASK: usize = 1 << KPC_CLASS_CONFIGURABLE; // 2
+const KPC_CLASS_POWER_MASK: usize = 1 << KPC_CLASS_POWER; // 4
+const KPC_CLASS_RAWPMU_MASK: usize = 1 << KPC_CLASS_RAWPMU; // 8
