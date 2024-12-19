@@ -235,6 +235,113 @@ struct kpep_event {
     is_fixed: u8,
 }
 
+struct kpep_config {
+    db: *mut kpep_db,
+    ///< (sizeof(kpep_event *) * counter_count), init NULL
+    ///< (sizeof(usize *) * counter_count), init 0
+    ev_map: *mut usize,
+    ///< (sizeof(usize *) * counter_count), init -1
+    ev_idx: *mut usize,
+    ///< (sizeof(u32 *) * counter_count), init 0
+    flags: *mut i32,
+    ///< (sizeof(u64 *) * counter_count), init 0
+    kpc_periods: *mut u64,
+    /// kpep_config_events_count()
+    event_count: usize,
+    counter_count: usize,
+    classes: u32,
+    ///< See `class mask constants` above.
+    config_counter: u32,
+    power_counter: u32,
+    reserved: u32,
+}
+
+const EVENT_NAME_MAX: usize = 8;
+
+struct event_alias {
+    /// name for print
+    alias: *const c_char,
+    /// name from pmc db
+    names: [*const c_char; EVENT_NAME_MAX],
+}
+
+/// Event names from /usr/share/kpep/<name>.plist
+const profile_events: [event_alias; 4] = [
+    event_alias {
+        alias: c"cycles".as_ptr(),
+        names: [
+            c"FIXED_CYCLES".as_ptr(),            // Apple A7-A15
+            c"CPU_CLK_UNHALTED.THREAD".as_ptr(), // Intel Core 1th-10th
+            c"CPU_CLK_UNHALTED.CORE".as_ptr(),   // Intel Yonah, Merom
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+        ],
+    },
+    event_alias {
+        alias: c"instructions".as_ptr(),
+        names: [
+            c"FIXED_INSTRUCTIONS".as_ptr(), // Apple A7-A15
+            c"INST_RETIRED.ANY".as_ptr(),   // Intel Yonah, Merom, Core 1th-10th
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+        ],
+    },
+    event_alias {
+        alias: c"branches".as_ptr(),
+        names: [
+            c"INST_BRANCH".as_ptr(),                  // Apple A7-A15
+            c"BR_INST_RETIRED.ALL_BRANCHES".as_ptr(), // Intel Core 1th-10th
+            c"INST_RETIRED.ANY".as_ptr(),             // Intel Yonah, Merom
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+        ],
+    },
+    event_alias {
+        alias: c"branch-misses".as_ptr(),
+        names: [
+            c"BRANCH_MISPRED_NONSPEC".as_ptr(), // Apple A7-A15, since iOS 15, macOS 12
+            c"BRANCH_MISPREDICT".as_ptr(),      // Apple A7-A14
+            c"BR_MISP_RETIRED.ALL_BRANCHES".as_ptr(), // Intel Core 2th-10th
+            c"BR_INST_RETIRED.MISPRED".as_ptr(), // Intel Yonah, Merom
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+        ],
+    },
+];
+
+unsafe fn get_event(
+    kperfdata: &KperfDataSymbols,
+    db: *mut kpep_db,
+    alias: *const event_alias,
+) -> *mut kpep_event {
+    for j in 0..EVENT_NAME_MAX {
+        let name = (*alias).names[j];
+
+        if name.is_null() {
+            break;
+        }
+
+        let mut ev = core::ptr::null_mut();
+        if (kperfdata.kpep_db_event)(db, name, &mut ev) == 0 {
+            return ev;
+        }
+    }
+
+    return core::ptr::null_mut();
+}
+
 struct AppleEvents {
     regs: [u32; KPC_MAX_COUNTERS],
     counter_map: [usize; KPC_MAX_COUNTERS],
@@ -305,6 +412,41 @@ impl AppleEvents {
         let name = unsafe { CStr::from_ptr((*db).name).to_string_lossy() };
         let marketing_name = unsafe { CStr::from_ptr((*db).marketing_name).to_string_lossy() };
         println!("Loaded db: {} ({})", name, marketing_name);
+
+        // create a config
+        let mut cfg: *mut kpep_config = core::ptr::null_mut();
+        match unsafe { (kperfdata_symbols.kpep_config_create)(db, &mut cfg) } {
+            0 => {}
+            ret => {
+                // eprintln!( "Failed to create kpep config: %d (%s).\n", ret, kpep_config_error_desc(ret),);
+                eprintln!("Failed to create kpep config");
+                self.worked = false;
+                return self.worked;
+            }
+        }
+
+        match unsafe { (kperfdata_symbols.kpep_config_force_counters)(cfg) } {
+            0 => {}
+            ret => {
+                // printf( "Failed to force counters: %d (%s).\n", ret, kpep_config_error_desc(ret),);
+                eprintln!("Failed to force counters");
+                self.worked = false;
+                return self.worked;
+            }
+        }
+
+        // get events
+        let mut ev_arr: [*mut kpep_event; profile_events.len()] =
+            [core::ptr::null_mut(); profile_events.len()];
+        for (i, alias) in profile_events.iter().enumerate() {
+            ev_arr[i] = unsafe { get_event(&kperfdata_symbols, db, alias) };
+            if ev_arr[i].is_null() {
+                // printf("Cannot find event: %s.\n", alias->alias);
+                eprintln!("Cannot find event");
+                self.worked = false;
+                return self.worked;
+            }
+        }
 
         todo!()
     }
@@ -427,27 +569,27 @@ load_dynlib_symbols!(
 
 load_dynlib_symbols!(
     KperfDataSymbols;
-    kpep_config_create: fn() -> u64,
-    kpep_config_free: fn() -> u64,
-    kpep_config_add_event: fn() -> u64,
-    kpep_config_remove_event: fn() -> u64,
-    kpep_config_force_counters: fn() -> u64,
-    kpep_config_events_count: fn() -> u64,
-    kpep_config_events: fn() -> u64,
-    kpep_config_kpc: fn() -> u64,
-    kpep_config_kpc_count: fn() -> u64,
-    kpep_config_kpc_classes: fn() -> u64,
-    kpep_config_kpc_map: fn() -> u64,
-    kpep_db_create: fn(*const c_char, *mut *mut kpep_db) -> u64,
-    kpep_db_free: fn() -> u64,
-    kpep_db_name: fn() -> u64,
-    kpep_db_aliases_count: fn() -> u64,
-    kpep_db_aliases: fn() -> u64,
-    kpep_db_counters_count: fn() -> u64,
-    kpep_db_events_count: fn() -> u64,
-    kpep_db_events: fn() -> u64,
-    kpep_db_event: fn() -> u64,
-    kpep_event_name: fn() -> u64,
-    kpep_event_alias: fn() -> u64,
-    kpep_event_description: fn() -> u64,
+    kpep_config_create: fn(*mut kpep_db, *mut *mut kpep_config) -> i32,
+    kpep_config_free: fn(*mut kpep_config) -> (),
+    kpep_config_add_event: fn(*mut kpep_config, *mut *mut kpep_event, u32, *mut u32) -> i32,
+    kpep_config_remove_event: fn(*mut kpep_config, usize) -> i32,
+    kpep_config_force_counters: fn(*mut kpep_config) -> i32,
+    kpep_config_events_count: fn(*mut kpep_config, *mut usize) -> i32,
+    kpep_config_events: fn(*mut kpep_config, *mut *mut kpep_event, usize) -> i32,
+    kpep_config_kpc: fn(*mut kpep_config, *mut u64, usize) -> i32,
+    kpep_config_kpc_count: fn(*mut kpep_config, *mut usize) -> i32,
+    kpep_config_kpc_classes: fn(*mut kpep_config, *mut u32) -> i32,
+    kpep_config_kpc_map: fn(*mut kpep_config, *mut usize, usize) -> i32,
+    kpep_db_create: fn(*const c_char, *mut *mut kpep_db) -> i32,
+    kpep_db_free: fn(*mut kpep_db) -> (),
+    kpep_db_name: fn(*mut kpep_db, *mut *const c_char) -> i32,
+    kpep_db_aliases_count: fn(*mut kpep_db, *mut usize) -> i32,
+    kpep_db_aliases: fn(*mut kpep_db, *mut *const c_char, usize) -> i32,
+    kpep_db_counters_count: fn(*mut kpep_db, u8, *mut usize) -> i32,
+    kpep_db_events_count: fn(*mut kpep_db, *mut usize) -> i32,
+    kpep_db_events: fn(*mut kpep_db, *mut *mut kpep_event, usize) -> i32,
+    kpep_db_event: fn(*mut kpep_db, *const c_char, *mut *mut kpep_event) -> i32,
+    kpep_event_name: fn(*mut kpep_event, *mut *const c_char) -> i32,
+    kpep_event_alias: fn(*mut kpep_event, *mut *const c_char) -> i32,
+    kpep_event_description: fn(*mut kpep_event, *mut *const c_char) -> i32,
 );
